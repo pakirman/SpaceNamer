@@ -221,57 +221,93 @@ final class SpaceObserver {
 // space list. The windows are transparent, click-through, and float above
 // the MC window at .screenSaver level.
 
-struct OverlayPill {
+struct OverlayPill: Equatable {
     let text: String
     let isCurrent: Bool
     let center: CGPoint    // view coords, AppKit bottom-left origin
     let minCover: CGFloat  // native label extent underneath — never leave it peeking out
     let maxWidth: CGFloat  // cap so pills never cover a neighbor label
+    var compact: Bool = false // collapsed strip on macOS 27: tighter, smaller type
+}
+
+/// One label chip, styled after Mission Control's own labels on macOS 27:
+/// a rounded, blurred, translucent capsule with white medium text. The blur
+/// smears the native label underneath and the tint hides what is left, so
+/// the chip reads as the label itself rather than a sticker on top.
+final class OverlayChip: NSView {
+    private let blur = NSVisualEffectView()
+    private let tint = NSView()
+    private let label = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.appearance = NSAppearance(named: .darkAqua)
+        tint.wantsLayer = true
+        label.alignment = .center
+        label.lineBreakMode = .byClipping
+        label.textColor = .white
+        label.appearance = NSAppearance(named: .darkAqua)
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.45)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        label.shadow = shadow
+        addSubview(blur); addSubview(tint); addSubview(label)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(_ pill: OverlayPill) {
+        let font = NSFont.systemFont(ofSize: pill.compact ? 12 : 13, weight: .medium)
+        let pad: CGFloat = pill.compact ? 14 : 20
+        var text = pill.text
+        var size = (text as NSString).size(withAttributes: [.font: font])
+        while text.count > 1, size.width > pill.maxWidth - pad {
+            text = String(text.dropLast(text.hasSuffix("…") ? 2 : 1)) + "…"
+            size = (text as NSString).size(withAttributes: [.font: font])
+        }
+        let w = min(max(size.width + pad, pill.minCover), max(pill.maxWidth, 40))
+        let h: CGFloat = pill.compact ? 22 : 24
+        frame = NSRect(x: (pill.center.x - w / 2).rounded(), y: (pill.center.y - h / 2).rounded(),
+                       width: w.rounded(), height: h)
+        blur.frame = bounds
+        tint.frame = bounds
+        tint.layer?.backgroundColor = pill.isCurrent
+            ? NSColor(white: 1, alpha: 0.26).cgColor
+            : NSColor(white: 0, alpha: 0.38).cgColor
+        layer?.borderWidth = pill.isCurrent ? 0.5 : 0
+        layer?.borderColor = NSColor(white: 1, alpha: 0.35).cgColor
+        label.font = font
+        label.stringValue = text
+        label.frame = NSRect(x: 0, y: (h - size.height) / 2 - 0.5, width: w, height: size.height)
+    }
 }
 
 final class OverlayLabelView: NSView {
+    private var chips: [OverlayChip] = []
     var pills: [OverlayPill] = [] {
-        didSet { needsDisplay = true }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        // Native Mission Control label styling: 13pt regular system text in a
-        // rounded rect (radius ~6, height ~22). The current space wears the
-        // system's gray selection; everything else sits on a near-strip dark
-        // so the pill reads as the label itself, not a sticker on top.
-        let font = NSFont.systemFont(ofSize: 13)
-        for pill in pills {
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: NSColor.white,
-            ]
-            var text = pill.text
-            var size = (text as NSString).size(withAttributes: attrs)
-            while text.count > 1, size.width > pill.maxWidth - 20 {
-                text = String(text.dropLast(text.hasSuffix("…") ? 2 : 1)) + "…"
-                size = (text as NSString).size(withAttributes: attrs)
+        didSet {
+            guard pills != oldValue else { return }
+            while chips.count > pills.count { chips.removeLast().removeFromSuperview() }
+            while chips.count < pills.count {
+                let c = OverlayChip(frame: .zero)
+                addSubview(c); chips.append(c)
             }
-            let pillW = min(max(size.width + 20, pill.minCover), max(pill.maxWidth, 40))
-            let pillH: CGFloat = 24
-            let rect = NSRect(
-                x: pill.center.x - pillW / 2,
-                y: pill.center.y - pillH / 2,
-                width: pillW,
-                height: pillH
-            )
-            // Fully opaque: the native label underneath must never show through.
-            let bg = pill.isCurrent
-                ? NSColor(white: 0.32, alpha: 1.0)
-                : NSColor(white: 0.13, alpha: 1.0)
-            bg.setFill()
-            NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
-            let textRect = NSRect(
-                x: pill.center.x - size.width / 2,
-                y: pill.center.y - size.height / 2,
-                width: size.width,
-                height: size.height
-            )
-            (text as NSString).draw(in: textRect, withAttributes: attrs)
+            for (c, p) in zip(chips, pills) { c.configure(p) }
+            // Fade the whole set in when labels (re)appear, instead of popping.
+            if oldValue.isEmpty, !pills.isEmpty {
+                alphaValue = 0
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.18
+                    animator().alphaValue = 1
+                }
+            }
         }
     }
 }
@@ -299,6 +335,11 @@ final class MCOverlayController {
     /// expanded (its height changes). nil on older systems, where the
     /// Dock-owned MC window and the hover latch are used instead.
     private var spacesBar: SpacesBarWindow?
+    /// Last few Spaces Bar heights (one per tick). The bar animates between
+    /// its collapsed and expanded sizes; pills are only placed once it has
+    /// held the same height for a few ticks, so they never chase the animation.
+    private var barHeights: [CGFloat] = []
+    private var barSettled = false
     /// Called at most every 0.3s while the overlay is visible — re-reads the
     /// CGS space list so pills track reorders quickly.
     var onTick: (() -> Void)?
@@ -375,6 +416,8 @@ final class MCOverlayController {
             overlayVisible = false
             expanded = false
             spacesBar = nil
+            barHeights = []
+            barSettled = false
             collapsedRects = [:]
             schedule(idleInterval)
             hide()
@@ -387,7 +430,11 @@ final class MCOverlayController {
             // (measured: 128pt collapsed, 244pt with thumbnails), so no
             // hover latch and no AX read are needed.
             expanded = bar.height > 180
+            barHeights.append(bar.height)
+            if barHeights.count > 3 { barHeights.removeFirst() }
+            barSettled = barHeights.count == 3 && barHeights.allSatisfy { $0 == bar.height }
         } else {
+            barSettled = true
             // Latch bar expansion: pointer entering the compact strip (~top 36pt)
             // expands it to thumbnails. Matching Dock's hover zone keeps the
             // hardcoded-geometry pills hidden whenever the bar isn't expanded.
@@ -620,6 +667,7 @@ final class MCOverlayController {
             let named = ordered.filter { $0.customName != nil }
 
             if let bar = spacesBar {
+                guard barSettled else { v.pills = []; continue }
                 v.pills = Self.windowManagerPills(bar: bar, screen: screen, ordered: ordered,
                                                   named: named, expanded: expanded)
                 continue
@@ -748,7 +796,8 @@ final class MCOverlayController {
                 guard let i = ordered.firstIndex(where: { $0.uuid == s.uuid }) else { continue }
                 out.append(OverlayPill(text: s.customName!, isCurrent: s.isCurrent,
                                        center: CGPoint(x: centers[i], y: y),
-                                       minCover: widths[i] + 2, maxWidth: widths[i] + gap - 2))
+                                       minCover: widths[i] + 2, maxWidth: widths[i] + gap - 2,
+                                       compact: true))
             }
             return out
         }
