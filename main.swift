@@ -294,6 +294,11 @@ final class MCOverlayController {
     private var collapsedRects: [NSScreen: [CGRect]] = [:]
     private var lastAXRead = Date.distantPast
     private var lastSpacesRefresh = Date.distantPast
+    /// macOS 27+: Mission Control is drawn by WindowManager, whose "Spaces
+    /// Bar" window tells us both that MC is open and whether the bar is
+    /// expanded (its height changes). nil on older systems, where the
+    /// Dock-owned MC window and the hover latch are used instead.
+    private var spacesBar: SpacesBarWindow?
     /// Called at most every 0.3s while the overlay is visible — re-reads the
     /// CGS space list so pills track reorders quickly.
     var onTick: (() -> Void)?
@@ -357,7 +362,8 @@ final class MCOverlayController {
     }
 
     private func tick() {
-        let open = isEnabled && Self.missionControlIsOpen()
+        let bar = isEnabled ? Self.spacesBarWindow() : nil
+        let open = isEnabled && (bar != nil || Self.missionControlIsOpen())
         if open && !overlayVisible {
             overlayVisible = true
             expanded = false
@@ -368,28 +374,37 @@ final class MCOverlayController {
         } else if !open && overlayVisible {
             overlayVisible = false
             expanded = false
+            spacesBar = nil
             collapsedRects = [:]
             schedule(idleInterval)
             hide()
         }
         guard overlayVisible else { return }
 
-        // Latch bar expansion: pointer entering the compact strip (~top 36pt)
-        // expands it to thumbnails. Matching Dock's hover zone keeps the
-        // hardcoded-geometry pills hidden whenever the bar isn't expanded.
-        if !expanded {
-            let mouse = NSEvent.mouseLocation
-            if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }),
-               mouse.y > screen.frame.maxY - 36 {
-                expanded = true
+        spacesBar = bar
+        if let bar {
+            // macOS 27+: the bar's own height says whether it is expanded
+            // (measured: 128pt collapsed, 244pt with thumbnails), so no
+            // hover latch and no AX read are needed.
+            expanded = bar.height > 180
+        } else {
+            // Latch bar expansion: pointer entering the compact strip (~top 36pt)
+            // expands it to thumbnails. Matching Dock's hover zone keeps the
+            // hardcoded-geometry pills hidden whenever the bar isn't expanded.
+            if !expanded {
+                let mouse = NSEvent.mouseLocation
+                if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }),
+                   mouse.y > screen.frame.maxY - 36 {
+                    expanded = true
+                }
             }
-        }
 
-        // Collapsed-state geometry from the Dock's AX tree; re-read sparingly —
-        // the strip is static while collapsed (reorders require expanding it).
-        if !expanded, Date().timeIntervalSince(lastAXRead) > 0.25 {
-            collapsedRects = Self.collapsedLabelRects() ?? [:]
-            lastAXRead = Date()
+            // Collapsed-state geometry from the Dock's AX tree; re-read sparingly —
+            // the strip is static while collapsed (reorders require expanding it).
+            if !expanded, Date().timeIntervalSince(lastAXRead) > 0.25 {
+                collapsedRects = Self.collapsedLabelRects() ?? [:]
+                lastAXRead = Date()
+            }
         }
 
         if Date().timeIntervalSince(lastSpacesRefresh) > 0.3 {
@@ -476,7 +491,56 @@ final class MCOverlayController {
         return found
     }
 
+    /// Mission Control's spaces bar as seen in the on-screen window list.
+    /// `frame` is in CG coordinates (top-left origin, global).
+    struct SpacesBarWindow {
+        let frame: CGRect
+        var height: CGFloat { frame.height }
+    }
+
+    /// macOS 27+: Mission Control belongs to the WindowManager process, which
+    /// puts a "Spaces Bar" window on screen (layer 14, full screen width,
+    /// hugging the top edge) for the strip and an "ExposeShieldWindow"
+    /// (layer 19, full screen) behind the thumbnails. Both vanish the instant
+    /// MC closes. Verified on macOS 27.0.1 (26A434): collapsed bar 128pt
+    /// high, expanded (thumbnails) 244pt.
+    ///
+    /// Window *names* are deliberately not used: `kCGWindowName` of other
+    /// processes is only filled in with Screen Recording permission, which
+    /// SpaceNamer does not ask for. Owner name, layer and bounds are enough.
+    static func spacesBarWindow() -> SpacesBarWindow? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return nil }
+        guard let primary = NSScreen.screens.first else { return nil }
+        for w in list {
+            guard (w[kCGWindowOwnerName as String] as? String) == "WindowManager",
+                  (w[kCGWindowLayer as String] as? Int) == 14,
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let x = b["X"] as? CGFloat, let y = b["Y"] as? CGFloat,
+                  let width = b["Width"] as? CGFloat, let height = b["Height"] as? CGFloat,
+                  height > 60, height < 500
+            else { continue }
+            // Full width of the screen it sits on, flush with that screen's top.
+            let screen = NSScreen.screens.first { s in
+                let top = primary.frame.maxY - s.frame.maxY // CG y of this screen's top
+                return abs(s.frame.origin.x - x) < 2 && abs(top - y) < 2
+            }
+            guard let screen, abs(screen.frame.width - width) < 2 else { continue }
+            return SpacesBarWindow(frame: CGRect(x: x, y: y, width: width, height: height))
+        }
+        return nil
+    }
+
+    /// Legacy detector (macOS 26 and earlier): Mission Control is a
+    /// full-screen window owned by the Dock at layer 20.
+    ///
+    /// Not used on macOS 27+: there the Dock keeps a permanent full-screen
+    /// window at layer 20 (the desktop/widgets layer) whether or not MC is
+    /// open, so this check is always true. Matching it made the overlay stick
+    /// on screen for good, with pills landing over ordinary windows as soon
+    /// as the pointer touched the menu bar. MC is drawn by WindowManager on
+    /// those systems and is found through `spacesBarWindow()` instead.
     static func missionControlIsOpen() -> Bool {
+        if #available(macOS 27, *) { return false }
         guard let dock = NSWorkspace.shared.runningApplications.first(where: {
             $0.bundleIdentifier == "com.apple.dock"
         }) else { return false }
@@ -555,6 +619,12 @@ final class MCOverlayController {
             let ordered = displaySpaces.sorted { $0.positionOnDisplay < $1.positionOnDisplay }
             let named = ordered.filter { $0.customName != nil }
 
+            if let bar = spacesBar {
+                v.pills = Self.windowManagerPills(bar: bar, screen: screen, ordered: ordered,
+                                                  named: named, expanded: expanded)
+                continue
+            }
+
             guard expanded else {
                 // Bar still collapsed (no hover yet): cover each native
                 // "Desktop N" label with a pill at its exact AX frame.
@@ -604,6 +674,102 @@ final class MCOverlayController {
             }
             v.pills = out
         }
+    }
+
+    // MARK: macOS 27+ geometry (WindowManager's Spaces Bar)
+    //
+    // Measured on macOS 27.0.1, 1728×1117pt built-in display, 6 desktops,
+    // from screen captures with and without hover:
+    //  - collapsed bar (window 128pt high): "Desktop N" labels sit on one
+    //    row centred at 52pt from the top of the screen, each label as wide
+    //    as its text plus ~22pt, with ~8pt between labels, the whole row
+    //    centred on the screen (the + button is outside the row).
+    //  - expanded bar (window 244pt high): thumbnails 93pt high (149pt wide
+    //    on this aspect ratio) spaced 170pt apart, labels centred 71pt above
+    //    the bottom of the bar, the row centred on the screen.
+    // Other desktop counts are extrapolated (the row shrinks to fit).
+    // The native label text is the Dock's localized "Desktop %@" ("Bureau 3"
+    // in French), which is what the pill has to cover.
+    /// The text Mission Control itself draws under a space: the Dock's
+    /// localized "Desktop %@" for a desktop, the app name for a full-screen
+    /// space. Falls back to the English `defaultName`.
+    private static let desktopFormat: String = {
+        // `localizedString(forKey:)` on another app's bundle follows *this*
+        // app's localization (English), not the user's language, so the
+        // matching .lproj is picked by hand from the user's language list.
+        let fallback = "Desktop %@"
+        guard let dock = Bundle(path: "/System/Library/CoreServices/Dock.app") else { return fallback }
+        let locs = Bundle.preferredLocalizations(from: dock.localizations,
+                                                 forPreferences: Locale.preferredLanguages)
+        for loc in locs + ["en", "Base"] {
+            guard let path = dock.path(forResource: "Localizable", ofType: "strings",
+                                       inDirectory: nil, forLocalization: loc),
+                  let dict = NSDictionary(contentsOfFile: path),
+                  let f = dict["DesktopNum"] as? String, f.contains("%@")
+            else { continue }
+            return f
+        }
+        return fallback
+    }()
+
+    private static func nativeLabel(_ s: Space) -> String {
+        if s.isFullScreen { return s.defaultName }
+        return desktopFormat.replacingOccurrences(of: "%@", with: String(s.desktopNumber))
+    }
+
+    private static func windowManagerPills(bar: SpacesBarWindow, screen: NSScreen,
+                                           ordered: [Space], named: [Space],
+                                           expanded: Bool) -> [OverlayPill] {
+        // The bar lives on one screen; draw nothing on the others.
+        guard let primary = NSScreen.screens.first else { return [] }
+        let cgTop = primary.frame.maxY - screen.frame.maxY
+        guard abs(bar.frame.origin.y - cgTop) < 2,
+              abs(bar.frame.origin.x - screen.frame.origin.x) < 2 else { return [] }
+
+        let W = screen.frame.width
+        let H = screen.frame.height
+        let n = ordered.count
+        guard n > 0 else { return [] }
+        let font = NSFont.systemFont(ofSize: 13)
+        func textWidth(_ s: String) -> CGFloat {
+            (s as NSString).size(withAttributes: [.font: font]).width
+        }
+        var out: [OverlayPill] = []
+
+        if !expanded {
+            let widths = ordered.map { textWidth(nativeLabel($0)) + 22 }
+            let gap: CGFloat = 8
+            let rowW = widths.reduce(0, +) + gap * CGFloat(n - 1)
+            var x = (W - rowW) / 2
+            let y = H - bar.height * (52.0 / 128.0)
+            var centers: [CGFloat] = []
+            for wdt in widths { centers.append(x + wdt / 2); x += wdt + gap }
+            for s in named {
+                guard let i = ordered.firstIndex(where: { $0.uuid == s.uuid }) else { continue }
+                out.append(OverlayPill(text: s.customName!, isCurrent: s.isCurrent,
+                                       center: CGPoint(x: centers[i], y: y),
+                                       minCover: widths[i] + 2, maxWidth: widths[i] + gap - 2))
+            }
+            return out
+        }
+
+        var thumbW = 93 * (W / H) + 5
+        var dx = thumbW + 21
+        let available = W * 0.9
+        if CGFloat(n) * dx > available {
+            let k = available / (CGFloat(n) * dx)
+            thumbW *= k; dx *= k
+        }
+        let x0 = (W - CGFloat(n - 1) * dx) / 2
+        let y = H - (bar.height - 71)
+        for s in named {
+            guard let i = ordered.firstIndex(where: { $0.uuid == s.uuid }) else { continue }
+            let nativeW = textWidth(nativeLabel(ordered[i])) + 30
+            out.append(OverlayPill(text: s.customName!, isCurrent: s.isCurrent,
+                                   center: CGPoint(x: x0 + CGFloat(i) * dx, y: y),
+                                   minCover: min(nativeW, dx - 8), maxWidth: dx - 8))
+        }
+        return out
     }
 
     private func screenID(for screen: NSScreen) -> String? {
