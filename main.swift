@@ -340,6 +340,9 @@ final class MCOverlayController {
     /// held the same height for a few ticks, so they never chase the animation.
     private var barHeights: [CGFloat] = []
     private var barSettled = false
+    /// macOS 27: the native items of the Spaces Bar read from WindowManager's
+    /// AX tree (centre x and label text), when Accessibility is granted.
+    private var axItems: [SpacesBarItem]? = nil
     /// Called at most every 0.3s while the overlay is visible — re-reads the
     /// CGS space list so pills track reorders quickly.
     var onTick: (() -> Void)?
@@ -418,6 +421,7 @@ final class MCOverlayController {
             spacesBar = nil
             barHeights = []
             barSettled = false
+            axItems = nil
             collapsedRects = [:]
             schedule(idleInterval)
             hide()
@@ -433,6 +437,10 @@ final class MCOverlayController {
             barHeights.append(bar.height)
             if barHeights.count > 3 { barHeights.removeFirst() }
             barSettled = barHeights.count == 3 && barHeights.allSatisfy { $0 == bar.height }
+            if barSettled, Date().timeIntervalSince(lastAXRead) > 0.25 {
+                axItems = Self.spacesBarAXItems()
+                lastAXRead = Date()
+            }
         } else {
             barSettled = true
             // Latch bar expansion: pointer entering the compact strip (~top 36pt)
@@ -669,7 +677,8 @@ final class MCOverlayController {
             if let bar = spacesBar {
                 guard barSettled else { v.pills = []; continue }
                 v.pills = Self.windowManagerPills(bar: bar, screen: screen, ordered: ordered,
-                                                  named: named, expanded: expanded)
+                                                  named: named, expanded: expanded,
+                                                  axItems: axItems)
                 continue
             }
 
@@ -760,6 +769,46 @@ final class MCOverlayController {
         return fallback
     }()
 
+    struct SpacesBarItem { let x: CGFloat; let title: String }
+
+    /// macOS 27+: with Accessibility granted, WindowManager exposes the
+    /// Spaces Bar as an AXGroup titled "Spaces Bar" holding an AXList with
+    /// one AXButton per space (title = the native label, e.g. "Bureau 3";
+    /// description "exit to …") plus the "add desktop" button. The buttons'
+    /// AXPosition.x is the item's centre in both the collapsed and the
+    /// expanded layout (checked against screen captures: 660, 740, 821…
+    /// collapsed; 435, 607, 778… expanded on a 1728pt-wide screen). Their
+    /// reported size (169×129) and y do not follow the layout, so only x and
+    /// the title are used. Returns nil without Accessibility or when the bar
+    /// is not in the tree, and the caller falls back to measured geometry.
+    private static func spacesBarAXItems() -> [SpacesBarItem]? {
+        guard WorkspaceEngine.accessibilityTrusted(prompt: false),
+              let wm = NSWorkspace.shared.runningApplications.first(where: {
+                  $0.bundleIdentifier == "com.apple.WindowManager" || $0.localizedName == "WindowManager"
+              }) else { return nil }
+        var queue = axChildren(AXUIElementCreateApplication(wm.processIdentifier))
+        var visited = 0
+        while !queue.isEmpty, visited < 200 {
+            let el = queue.removeFirst()
+            visited += 1
+            let role: String? = axAttr(el, kAXRoleAttribute as String)
+            guard role == "AXGroup" else { continue }
+            let title: String? = axAttr(el, kAXTitleAttribute as String)
+            guard title == "Spaces Bar" else { queue.append(contentsOf: axChildren(el)); continue }
+            var items: [SpacesBarItem] = []
+            for list in axChildren(el) {
+                for b in axChildren(list) {
+                    let r: String? = axAttr(b, kAXRoleAttribute as String)
+                    let t: String? = axAttr(b, kAXTitleAttribute as String)
+                    guard r == "AXButton", let t, !t.isEmpty, let f = axFrame(b) else { continue }
+                    items.append(SpacesBarItem(x: f.origin.x, title: t))
+                }
+            }
+            return items.isEmpty ? nil : items.sorted { $0.x < $1.x }
+        }
+        return nil
+    }
+
     private static func nativeLabel(_ s: Space) -> String {
         if s.isFullScreen { return s.defaultName }
         return desktopFormat.replacingOccurrences(of: "%@", with: String(s.desktopNumber))
@@ -767,7 +816,8 @@ final class MCOverlayController {
 
     private static func windowManagerPills(bar: SpacesBarWindow, screen: NSScreen,
                                            ordered: [Space], named: [Space],
-                                           expanded: Bool) -> [OverlayPill] {
+                                           expanded: Bool,
+                                           axItems: [SpacesBarItem]?) -> [OverlayPill] {
         // The bar lives on one screen; draw nothing on the others.
         guard let primary = NSScreen.screens.first else { return [] }
         let cgTop = primary.frame.maxY - screen.frame.maxY
@@ -783,13 +833,31 @@ final class MCOverlayController {
             (s as NSString).size(withAttributes: [.font: font]).width
         }
         var out: [OverlayPill] = []
+        let yCollapsed = H - bar.height * (52.0 / 128.0)
+        let yExpanded = H - (bar.height - 71)
+
+        // Exact positions from the AX tree whenever it lists one item per
+        // space on this display; everything below is the fallback.
+        if let items = axItems, items.count == n {
+            let xs = items.map { $0.x - screen.frame.origin.x }
+            let spacing = zip(xs.dropFirst(), xs).map { $0 - $1 }.min() ?? 200
+            for s in named {
+                guard let i = ordered.firstIndex(where: { $0.uuid == s.uuid }) else { continue }
+                let nativeW = textWidth(items[i].title) + (expanded ? 30 : 22)
+                out.append(OverlayPill(text: s.customName!, isCurrent: s.isCurrent,
+                                       center: CGPoint(x: xs[i], y: expanded ? yExpanded : yCollapsed),
+                                       minCover: min(nativeW, spacing - 6), maxWidth: spacing - 6,
+                                       compact: !expanded))
+            }
+            return out
+        }
 
         if !expanded {
             let widths = ordered.map { textWidth(nativeLabel($0)) + 22 }
             let gap: CGFloat = 8
             let rowW = widths.reduce(0, +) + gap * CGFloat(n - 1)
             var x = (W - rowW) / 2
-            let y = H - bar.height * (52.0 / 128.0)
+            let y = yCollapsed
             var centers: [CGFloat] = []
             for wdt in widths { centers.append(x + wdt / 2); x += wdt + gap }
             for s in named {
@@ -810,7 +878,7 @@ final class MCOverlayController {
             thumbW *= k; dx *= k
         }
         let x0 = (W - CGFloat(n - 1) * dx) / 2
-        let y = H - (bar.height - 71)
+        let y = yExpanded
         for s in named {
             guard let i = ordered.firstIndex(where: { $0.uuid == s.uuid }) else { continue }
             let nativeW = textWidth(nativeLabel(ordered[i])) + 30
