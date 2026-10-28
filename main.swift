@@ -340,6 +340,11 @@ final class MCOverlayController {
     /// held the same height for a few ticks, so they never chase the animation.
     private var barHeights: [CGFloat] = []
     private var barSettled = false
+    /// Height of the Spaces Bar when it first appeared for this Mission
+    /// Control session: collapsed (128) when opened normally, expanded (244)
+    /// when the pointer was already at the top edge. Mission Control lays the
+    /// thumbnails out differently in the two cases (see windowManagerPills).
+    private var barFirstHeight: CGFloat?
     /// macOS 27: the native items of the Spaces Bar read from WindowManager's
     /// AX tree (centre x and label text), when Accessibility is granted.
     private var axItems: [SpacesBarItem]? = nil
@@ -421,6 +426,7 @@ final class MCOverlayController {
             spacesBar = nil
             barHeights = []
             barSettled = false
+            barFirstHeight = nil
             axItems = nil
             collapsedRects = [:]
             schedule(idleInterval)
@@ -434,6 +440,7 @@ final class MCOverlayController {
             // (measured: 128pt collapsed, 244pt with thumbnails), so no
             // hover latch and no AX read are needed.
             expanded = bar.height > 180
+            if barFirstHeight == nil { barFirstHeight = bar.height }
             barHeights.append(bar.height)
             if barHeights.count > 3 { barHeights.removeFirst() }
             barSettled = barHeights.count == 3 && barHeights.allSatisfy { $0 == bar.height }
@@ -678,6 +685,7 @@ final class MCOverlayController {
                 guard barSettled else { v.pills = []; continue }
                 v.pills = Self.windowManagerPills(bar: bar, screen: screen, ordered: ordered,
                                                   named: named, expanded: expanded,
+                                                  expandedFromHover: expanded && (barFirstHeight ?? 0) < 180,
                                                   axItems: axItems)
                 continue
             }
@@ -743,7 +751,9 @@ final class MCOverlayController {
     //    centred on the screen (the + button is outside the row).
     //  - expanded bar (window 244pt high): thumbnails 93pt high (149pt wide
     //    on this aspect ratio) spaced 170pt apart, labels centred 71pt above
-    //    the bottom of the bar, the row centred on the screen.
+    //    the bottom of the bar; the row is centred on the screen when the bar
+    //    opens expanded, and shifted half a slot left when it expands from a
+    //    hover over the collapsed strip.
     // Other desktop counts are extrapolated (the row shrinks to fit).
     // The native label text is the Dock's localized "Desktop %@" ("Bureau 3"
     // in French), which is what the pill has to cover.
@@ -816,7 +826,7 @@ final class MCOverlayController {
 
     private static func windowManagerPills(bar: SpacesBarWindow, screen: NSScreen,
                                            ordered: [Space], named: [Space],
-                                           expanded: Bool,
+                                           expanded: Bool, expandedFromHover: Bool,
                                            axItems: [SpacesBarItem]?) -> [OverlayPill] {
         // The bar lives on one screen; draw nothing on the others.
         guard let primary = NSScreen.screens.first else { return [] }
@@ -877,7 +887,13 @@ final class MCOverlayController {
             let k = available / (CGFloat(n) * dx)
             thumbW *= k; dx *= k
         }
-        let x0 = (W - CGFloat(n - 1) * dx) / 2
+        // Measured: when Mission Control opens with the pointer already at the
+        // top edge, the thumbnails row is centred (6 desktops: centres at
+        // 436, 607, …); when the bar expands later because the pointer
+        // entered the collapsed strip, the whole row sits half a slot
+        // further left (350, 521, …), as if laid out for one more item.
+        var x0 = (W - CGFloat(n - 1) * dx) / 2
+        if expandedFromHover { x0 -= dx / 2 }
         let y = yExpanded
         for s in named {
             guard let i = ordered.firstIndex(where: { $0.uuid == s.uuid }) else { continue }
